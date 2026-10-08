@@ -20,6 +20,8 @@ use crate::store::Store;
 pub struct Config {
     pub data_dir: PathBuf,
     pub limits: Limits,
+    /// Show invented devices and jobs and don't touch USB. For screenshots and trying the UI.
+    pub demo: bool,
 }
 
 pub struct Paths {
@@ -95,13 +97,18 @@ impl Fleet {
         let engine = JobEngine::new(store, paths.job_logs.clone(), config.limits)?;
         let backend = NativeBackend::new(registry.clone());
         let shutdown = CancellationToken::new();
-        backend.start(shutdown.clone());
+        if !config.demo {
+            backend.start(shutdown.clone());
+        }
 
         let library = Arc::new(Mutex::new(Vec::new()));
         let fleet = Self { engine, registry, paths, backend, runtime: tokio::runtime::Handle::current(), library, backups: Arc::new(Mutex::new(Vec::new())), shutdown, _instance_lock: lock };
         fleet.refresh_library();
         fleet.refresh_backups();
         fleet.register_runners();
+        if config.demo {
+            crate::demo::load(&fleet)?;
+        }
         Ok(fleet)
     }
 

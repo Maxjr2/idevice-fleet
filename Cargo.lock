@@ -1392,6 +1392,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "fleet-core",
+ "image",
  "tokio",
  "tracing",
  "tracing-appender",

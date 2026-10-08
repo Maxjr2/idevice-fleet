@@ -18,3 +18,4 @@ tracing-appender.workspace = true
 directories.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
+image.workspace = true

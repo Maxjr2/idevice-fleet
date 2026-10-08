@@ -1,5 +1,6 @@
 //! iDevice Fleet desktop app.
 
+mod theme;
 mod ui;
 
 use std::path::PathBuf;
@@ -8,16 +9,34 @@ use std::sync::Arc;
 use fleet_core::{Config, Fleet, Limits};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-fn data_dir() -> PathBuf {
+/// The value after `--name`, or from `--name=value`.
+fn arg(name: &str) -> Option<String> {
+    let flag = format!("--{name}");
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        if a == "--data" {
-            if let Some(p) = args.next() {
-                return PathBuf::from(p);
-            }
-        } else if let Some(p) = a.strip_prefix("--data=") {
-            return PathBuf::from(p);
+        if a == flag {
+            return args.next();
         }
+        if let Some(v) = a.strip_prefix(&format!("{flag}=")) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn has_flag(name: &str) -> bool {
+    std::env::args().skip(1).any(|a| a == format!("--{name}"))
+}
+
+fn data_dir() -> PathBuf {
+    if has_flag("demo") {
+        // Demo data lives apart from the real database and is rebuilt every run.
+        let d = std::env::temp_dir().join("idevice-fleet-demo");
+        let _ = std::fs::remove_dir_all(&d);
+        return d;
+    }
+    if let Some(p) = arg("data") {
+        return PathBuf::from(p);
     }
     if let Some(p) = std::env::var_os("IDEVICE_FLEET_DATA") {
         return PathBuf::from(p);
@@ -58,12 +77,20 @@ fn main() -> eframe::Result {
 
     let started = {
         let _guard = runtime.enter();
-        Fleet::start(Config { data_dir: data.clone(), limits: Limits::default() })
+        Fleet::start(Config { data_dir: data.clone(), limits: Limits::default(), demo: has_flag("demo") })
     };
 
+    let (w, h) = arg("size").and_then(|s| s.split_once('x').map(|(w, h)| (w.parse().unwrap_or(1180.0), h.parse().unwrap_or(760.0)))).unwrap_or((1180.0, 760.0));
+    let ui_options = ui::Options {
+        screenshot: arg("screenshot").map(PathBuf::from),
+        tab: arg("tab"),
+        lookup: arg("lookup"),
+        theme: arg("theme"),
+        select_job: has_flag("demo"),
+    };
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
+            .with_inner_size([w, h])
             .with_min_inner_size([720.0, 480.0])
             .with_app_id("idevice-fleet"),
         ..Default::default()
@@ -74,7 +101,7 @@ fn main() -> eframe::Result {
             let fleet = Arc::new(fleet);
             tracing::info!("started, data folder {}", data.display());
             let ui_fleet = fleet.clone();
-            let result = eframe::run_native("iDevice Fleet", options, Box::new(move |cc| Ok(Box::new(ui::FleetApp::new(cc, ui_fleet)))));
+            let result = eframe::run_native("iDevice Fleet", options, Box::new(move |cc| Ok(Box::new(ui::FleetApp::new(cc, ui_fleet, ui_options)))));
             // Window closed: stop jobs cleanly before the runtime goes away.
             runtime.block_on(fleet.shutdown());
             result
