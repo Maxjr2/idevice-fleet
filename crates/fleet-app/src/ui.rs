@@ -2,13 +2,14 @@
 //! all device work happens on the Tokio runtime, so the UI never blocks.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use fleet_core::model::now_secs;
-use fleet_core::{Device, DeviceKey, DeviceMode, ErrorClass, Fleet, Health, JobId, JobState, JobView, PairState};
+use fleet_core::firmware::Firmware;
+use fleet_core::{Device, Lookup, DeviceKey, DeviceMode, ErrorClass, Fleet, Health, JobId, JobState, JobView, PairState};
 
 const OK: Color32 = Color32::from_rgb(0x2f, 0x9e, 0x5b);
 const WARN: Color32 = Color32::from_rgb(0xd0, 0x8a, 0x10);
@@ -21,7 +22,16 @@ struct Notice {
     until: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Devices,
+    Firmware,
+}
+
 pub struct FleetApp {
+    tab: Tab,
+    identifier: String,
+    lookup: Arc<Mutex<Lookup>>,
     fleet: Arc<Fleet>,
     revision: u64,
     devices: Vec<Device>,
@@ -35,6 +45,9 @@ impl FleetApp {
     pub fn new(cc: &eframe::CreationContext<'_>, fleet: Arc<Fleet>) -> Self {
         cc.egui_ctx.set_zoom_factor(1.0);
         let mut app = Self {
+            tab: Tab::Devices,
+            identifier: String::new(),
+            lookup: Arc::new(Mutex::new(Lookup::Idle)),
             fleet,
             revision: 0,
             devices: Vec::new(),
@@ -198,6 +211,126 @@ impl FleetApp {
         }
     }
 
+    fn firmware_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Get firmware");
+        ui.label("Look up a model to see which versions Apple still signs. Only signed firmware can be restored.");
+        if self.identifier.is_empty()
+            && let Some(p) = self.devices.iter().find_map(|d| d.product_type.clone())
+        {
+            self.identifier = p;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Model identifier");
+            let edit = ui.add(egui::TextEdit::singleline(&mut self.identifier).hint_text("iPad13,18").desired_width(160.0));
+            let loading = matches!(*self.lookup.lock().unwrap_or_else(|p| p.into_inner()), Lookup::Loading);
+            let go = ui.add_enabled(!loading && !self.identifier.trim().is_empty(), egui::Button::new("Look up")).clicked()
+                || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !loading);
+            if go {
+                self.fleet.start_lookup(&self.identifier, self.lookup.clone());
+            }
+            let models: Vec<String> = self.devices.iter().filter_map(|d| d.product_type.clone()).collect::<HashSet<_>>().into_iter().collect();
+            for m in models {
+                if ui.small_button(&m).clicked() {
+                    self.identifier = m;
+                    self.fleet.start_lookup(&self.identifier, self.lookup.clone());
+                }
+            }
+        });
+        let lookup = self.lookup.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let library = self.fleet.library();
+        match lookup {
+            Lookup::Idle => {}
+            Lookup::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Looking up…");
+                });
+            }
+            Lookup::Failed(e) => {
+                ui.colored_label(BAD, e);
+            }
+            Lookup::Done(cat) => {
+                let signed = cat.firmwares.iter().filter(|f| f.signed).count();
+                ui.label(format!("{}: {} signed of {} versions", if cat.name.is_empty() { &cat.identifier } else { &cat.name }, signed, cat.firmwares.len()));
+                let mut to_download: Option<Firmware> = None;
+                egui::ScrollArea::vertical().id_salt("catalog").max_height(260.0).show(ui, |ui| {
+                    TableBuilder::new(ui)
+                        .id_salt("catalog_table")
+                        .striped(true)
+                        .column(Column::exact(80.0))
+                        .column(Column::exact(80.0))
+                        .column(Column::exact(90.0))
+                        .column(Column::exact(80.0))
+                        .column(Column::remainder())
+                        .header(20.0, |mut h| {
+                            for t in ["Version", "Build", "Size", "Signed", ""] {
+                                h.col(|ui| {
+                                    ui.strong(t);
+                                });
+                            }
+                        })
+                        .body(|mut body| {
+                            for f in cat.firmwares.iter().take(40) {
+                                let have = library.iter().any(|l| l.build.as_deref() == Some(f.build.as_str()) && l.product_types.contains(&cat.identifier));
+                                body.row(24.0, |mut row| {
+                                    row.col(|ui| {
+                                        ui.label(&f.version);
+                                    });
+                                    row.col(|ui| {
+                                        ui.monospace(&f.build);
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(format!("{:.2} GB", f.size as f64 / 1e9));
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(if f.signed { OK } else { BAD }, if f.signed { "signed" } else { "not signed" });
+                                    });
+                                    row.col(|ui| {
+                                        if have {
+                                            ui.weak("In library");
+                                        } else if ui.button("Download").on_hover_text(if f.signed { "" } else { "Apple no longer signs this version, so it can't be restored" }).clicked() {
+                                            to_download = Some(f.clone());
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                });
+                if let Some(f) = to_download {
+                    let r = self.fleet.download_firmware(&f);
+                    self.notify(r, "Download");
+                }
+            }
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.heading("Library");
+            if ui.button("Refresh").clicked() {
+                self.fleet.refresh_library();
+            }
+            ui.label(RichText::new(self.fleet.paths.firmware.display().to_string()).small().weak());
+        });
+        if library.is_empty() {
+            ui.weak("No firmware yet. Look up a model above and download its signed version, or copy .ipsw files into the folder.");
+        }
+        egui::ScrollArea::vertical().id_salt("library").show(ui, |ui| {
+            for l in &library {
+                ui.horizontal(|ui| {
+                    ui.monospace(&l.file);
+                    match &l.error {
+                        Some(e) => {
+                            ui.colored_label(BAD, e);
+                        }
+                        None => {
+                            ui.label(format!("{} ({}) · {} models · {:.2} GB", l.version.as_deref().unwrap_or("?"), l.build.as_deref().unwrap_or("?"), l.product_types.len(), l.size as f64 / 1e9));
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     fn jobs_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Jobs");
@@ -313,7 +446,15 @@ impl eframe::App for FleetApp {
             self.jobs_panel(ui);
         });
         egui::CentralPanel::default().show(ui, |ui| {
-            self.devices_table(ui);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Devices, "Devices");
+                ui.selectable_value(&mut self.tab, Tab::Firmware, "Firmware");
+            });
+            ui.separator();
+            match self.tab {
+                Tab::Devices => self.devices_table(ui),
+                Tab::Firmware => self.firmware_tab(ui),
+            }
         });
         // Device and job changes arrive from other threads; poll cheaply.
         ui.ctx().request_repaint_after(Duration::from_millis(400));

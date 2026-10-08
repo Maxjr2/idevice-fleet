@@ -12,7 +12,7 @@ Written in Rust on top of the pure-Rust [`idevice`](https://github.com/jkcoxson/
 | Device list across normal / recovery / DFU mode, tracked by ECID | ✅ |
 | Pair (trust), enter recovery, exit recovery | ✅ |
 | Job engine: retries, watchdog, crash recovery, logs | ✅ |
-| Firmware library: signed-version lookup, resumable verified downloads | planned |
+| Firmware library: signed-version lookup, resumable checksum-verified downloads | ✅ |
 | Backups (mobilebackup2) | planned |
 | Firmware restore (native, with `idevicerestore` as per-job fallback) | planned |
 | Windows | later |

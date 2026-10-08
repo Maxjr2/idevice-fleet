@@ -3,6 +3,7 @@
 
 pub mod devices;
 pub mod error;
+pub mod firmware;
 pub mod fleet;
 pub mod jobs;
 pub mod model;
@@ -12,6 +13,6 @@ pub mod usb;
 
 pub use devices::Health;
 pub use error::{ErrorClass, FleetError, Result};
-pub use fleet::{Config, Fleet};
+pub use fleet::{Config, Fleet, Lookup};
 pub use jobs::{JobContext, JobEngine, JobId, JobKind, JobSpec, JobState, JobView, Limits, RetryPolicy};
 pub use model::{Device, DeviceKey, DeviceMode, PairState};
