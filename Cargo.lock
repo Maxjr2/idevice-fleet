@@ -1405,6 +1405,7 @@ dependencies = [
  "futures",
  "hex",
  "idevice",
+ "libc",
  "nusb",
  "plist",
  "rusqlite",

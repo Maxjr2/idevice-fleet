@@ -13,7 +13,7 @@ Written in Rust on top of the pure-Rust [`idevice`](https://github.com/jkcoxson/
 | Pair (trust), enter recovery, exit recovery | ✅ |
 | Job engine: retries, watchdog, crash recovery, logs | ✅ |
 | Firmware library: signed-version lookup, resumable checksum-verified downloads | ✅ |
-| Backups (mobilebackup2) | planned |
+| Backups (mobilebackup2): full backup with disk-space preflight, backup list | ✅ |
 | Firmware restore (native, with `idevicerestore` as per-job fallback) | planned |
 | Windows | later |
 

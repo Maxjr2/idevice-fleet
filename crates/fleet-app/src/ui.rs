@@ -26,9 +26,12 @@ struct Notice {
 enum Tab {
     Devices,
     Firmware,
+    Backups,
 }
 
 pub struct FleetApp {
+    /// Set when drawing the UI panicked; the window shows this instead of crashing.
+    crashed: Option<String>,
     tab: Tab,
     identifier: String,
     lookup: Arc<Mutex<Lookup>>,
@@ -45,6 +48,7 @@ impl FleetApp {
     pub fn new(cc: &eframe::CreationContext<'_>, fleet: Arc<Fleet>) -> Self {
         cc.egui_ctx.set_zoom_factor(1.0);
         let mut app = Self {
+            crashed: None,
             tab: Tab::Devices,
             identifier: String::new(),
             lookup: Arc::new(Mutex::new(Lookup::Idle)),
@@ -188,6 +192,9 @@ impl FleetApp {
                                 if d.pair_state == PairState::NotPaired && ui.add_enabled(free, egui::Button::new("Trust")).on_hover_text("Pair: unlock the device and tap Trust").clicked() {
                                     action = Some((Action::Pair, d.key.clone()));
                                 }
+                                if ui.add_enabled(free && d.pair_state == PairState::Paired, egui::Button::new("Back up")).on_hover_text("Full backup into the backup folder").clicked() {
+                                    action = Some((Action::Backup, d.key.clone()));
+                                }
                                 if ui.add_enabled(free && d.pair_state == PairState::Paired, egui::Button::new("Recovery mode")).clicked() {
                                     action = Some((Action::EnterRecovery, d.key.clone()));
                                 }
@@ -204,6 +211,7 @@ impl FleetApp {
         if let Some((a, key)) = action {
             let (r, what) = match a {
                 Action::Pair => (self.fleet.pair(&key), "Pairing"),
+                Action::Backup => (self.fleet.backup(&key), "Backup"),
                 Action::EnterRecovery => (self.fleet.enter_recovery(&key), "Entering recovery"),
                 Action::ExitRecovery => (self.fleet.exit_recovery(&key), "Exiting recovery"),
             };
@@ -331,6 +339,75 @@ impl FleetApp {
         });
     }
 
+    fn backups_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Backups");
+            if ui.button("Refresh").clicked() {
+                self.fleet.refresh_backups();
+            }
+            ui.label(RichText::new(self.fleet.paths.backups.display().to_string()).small().weak());
+        });
+        ui.label("Full device backups made with Back up. Turn on backup encryption on the device first, or saved passwords, Health and Wi-Fi data are left out.");
+        let backups = self.fleet.backups();
+        if backups.is_empty() {
+            ui.add_space(20.0);
+            ui.weak("No backups yet.");
+            return;
+        }
+        TableBuilder::new(ui)
+            .id_salt("backups")
+            .striped(true)
+            .column(Column::initial(200.0).at_least(100.0))
+            .column(Column::initial(110.0))
+            .column(Column::initial(70.0))
+            .column(Column::initial(120.0))
+            .column(Column::initial(150.0))
+            .column(Column::initial(90.0))
+            .column(Column::initial(90.0))
+            .column(Column::remainder())
+            .header(22.0, |mut h| {
+                for t in ["Device", "Model", "OS", "Serial", "Last backup", "Encrypted", "Complete", "Size"] {
+                    h.col(|ui| {
+                        ui.strong(t);
+                    });
+                }
+            })
+            .body(|mut body| {
+                for b in &backups {
+                    body.row(24.0, |mut row| {
+                        row.col(|ui| {
+                            ui.label(b.device_name.as_deref().unwrap_or(&b.folder));
+                        });
+                        row.col(|ui| {
+                            ui.label(b.product_type.as_deref().unwrap_or(""));
+                        });
+                        row.col(|ui| {
+                            ui.label(b.os_version.as_deref().unwrap_or(""));
+                        });
+                        row.col(|ui| {
+                            ui.monospace(b.serial.as_deref().unwrap_or(""));
+                        });
+                        row.col(|ui| {
+                            ui.label(b.date.map(ago).unwrap_or_default());
+                        });
+                        row.col(|ui| {
+                            match b.encrypted {
+                                Some(true) => ui.colored_label(OK, "yes"),
+                                Some(false) => ui.colored_label(WARN, "no"),
+                                None => ui.weak("?"),
+                            };
+                        });
+                        row.col(|ui| {
+                            if b.complete { ui.colored_label(OK, "yes") } else { ui.colored_label(BAD, "unfinished") };
+                        });
+                        row.col(|ui| {
+                            ui.label(format!("{:.2} GB", b.size as f64 / 1e9));
+                        });
+                    });
+                }
+            });
+    }
+
     fn jobs_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Jobs");
@@ -429,12 +506,48 @@ impl FleetApp {
 #[derive(Clone, Copy)]
 enum Action {
     Pair,
+    Backup,
     EnterRecovery,
     ExitRecovery,
 }
 
 impl eframe::App for FleetApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // A bug in drawing code must not take the window (and the running jobs'
+        // view) down with it. Jobs live in the engine and keep running regardless.
+        if let Some(msg) = self.crashed.clone() {
+            let mut retry = false;
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.add_space(30.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("Something went wrong in the window");
+                    ui.add_space(6.0);
+                    ui.label("Your jobs are still running in the background. This is a display problem only.");
+                    ui.add_space(6.0);
+                    ui.colored_label(BAD, &msg);
+                    ui.add_space(10.0);
+                    retry = ui.button("Try again").clicked();
+                    ui.label(RichText::new(format!("Details are in {}", self.fleet.paths.logs.join("app.log").display())).small().weak());
+                });
+            });
+            if retry {
+                self.crashed = None;
+                self.revision = 0;
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+            return;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.draw(ui)));
+        if let Err(payload) = result {
+            let msg = payload.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "unknown error".into());
+            tracing::error!("UI panic caught: {msg}");
+            self.crashed = Some(msg);
+        }
+    }
+}
+
+impl FleetApp {
+    fn draw(&mut self, ui: &mut egui::Ui) {
         self.refresh();
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(6.0);
@@ -449,11 +562,13 @@ impl eframe::App for FleetApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Devices, "Devices");
                 ui.selectable_value(&mut self.tab, Tab::Firmware, "Firmware");
+                ui.selectable_value(&mut self.tab, Tab::Backups, "Backups");
             });
             ui.separator();
             match self.tab {
                 Tab::Devices => self.devices_table(ui),
                 Tab::Firmware => self.firmware_tab(ui),
+                Tab::Backups => self.backups_tab(ui),
             }
         });
         // Device and job changes arrive from other threads; poll cheaply.

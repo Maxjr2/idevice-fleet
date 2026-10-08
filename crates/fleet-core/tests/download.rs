@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 /// Tiny HTTP server: serves `data`, honours Range, and can cut the first
 /// response short to simulate a dropped connection.
-fn serve(data: Arc<Vec<u8>>, cut_first_at: Option<usize>) -> (String, Arc<AtomicUsize>) {
+fn serve(data: Arc<Vec<u8>>, cut_first_at: Option<usize>, cut_all: bool) -> (String, Arc<AtomicUsize>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/fw.ipsw", l.local_addr().unwrap());
     let hits = Arc::new(AtomicUsize::new(0));
@@ -34,7 +34,7 @@ fn serve(data: Arc<Vec<u8>>, cut_first_at: Option<usize>) -> (String, Arc<Atomic
                 let body = &data[start..];
                 let (status, extra) = if start > 0 { ("206 Partial Content", format!("Content-Range: bytes {start}-{}/{}\r\n", data.len() - 1, data.len())) } else { ("200 OK", String::new()) };
                 let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n", body.len());
-                let send = if n == 0 { cut_first_at.map(|c| c.min(body.len())).unwrap_or(body.len()) } else { body.len() };
+                let send = if n == 0 || cut_all { cut_first_at.map(|c| c.min(body.len())).unwrap_or(body.len()) } else { body.len() };
                 let _ = s.write_all(&body[..send]);
                 let _ = s.flush();
                 if send < body.len() {
@@ -78,7 +78,7 @@ fn resumes_after_a_dropped_connection_and_verifies() {
     let dir = tempfile::tempdir().unwrap();
     let data = sample(3_000_000);
     let sha = hex::encode(Sha256::digest(&*data));
-    let (url, hits) = serve(data.clone(), Some(1_200_000));
+    let (url, hits) = serve(data.clone(), Some(1_200_000), false);
     let (state, err) = run_download(dir.path(), url, Some(sha), data.len() as u64, 3);
     assert_eq!(state, JobState::Succeeded, "{err:?}");
     assert_eq!(std::fs::read(dir.path().join("fw.ipsw")).unwrap(), *data);
@@ -90,7 +90,7 @@ fn resumes_after_a_dropped_connection_and_verifies() {
 fn bad_checksum_is_rejected_and_nothing_is_kept() {
     let dir = tempfile::tempdir().unwrap();
     let data = sample(500_000);
-    let (url, _) = serve(data.clone(), None);
+    let (url, _) = serve(data.clone(), None, false);
     let (state, err) = run_download(dir.path(), url, Some("0".repeat(64)), data.len() as u64, 1);
     assert_eq!(state, JobState::Failed);
     assert!(err.unwrap().contains("checksum"));
@@ -104,8 +104,21 @@ fn continues_from_an_existing_partial_file() {
     let data = sample(2_000_000);
     std::fs::write(dir.path().join("fw.ipsw.part"), &data[..700_000]).unwrap();
     let sha = hex::encode(Sha256::digest(&*data));
-    let (url, _) = serve(data.clone(), None);
+    let (url, _) = serve(data.clone(), None, false);
     let (state, err) = run_download(dir.path(), url, Some(sha), data.len() as u64, 1);
     assert_eq!(state, JobState::Succeeded, "{err:?}");
     assert_eq!(std::fs::read(dir.path().join("fw.ipsw")).unwrap(), *data);
+}
+
+#[test]
+fn survives_a_server_that_drops_every_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = sample(3_000_000);
+    let sha = hex::encode(Sha256::digest(&*data));
+    let (url, hits) = serve(data.clone(), Some(400_000), true);
+    // One job attempt is enough: the download reconnects by itself.
+    let (state, err) = run_download(dir.path(), url, Some(sha), data.len() as u64, 1);
+    assert_eq!(state, JobState::Succeeded, "{err:?}");
+    assert_eq!(std::fs::read(dir.path().join("fw.ipsw")).unwrap(), *data);
+    assert!(hits.load(Ordering::SeqCst) >= 7, "resumed many times: {}", hits.load(Ordering::SeqCst));
 }

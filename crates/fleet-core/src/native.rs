@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::devices::{Health, NormalInfo, Registry};
 use crate::error::{FleetError, Result};
+use crate::backup::{self, FleetDelegate};
 use crate::jobs::JobContext;
+use idevice::services::mobilebackup2::MobileBackup2Client;
 use crate::usb;
 
 const LABEL: &str = "idevice-fleet";
@@ -195,6 +197,66 @@ impl NativeBackend {
         }
     }
 
+    /// Full device backup into `backup_root/<udid>/`.
+    pub async fn backup(&self, ctx: &JobContext, udid: &str, backup_root: &std::path::Path) -> Result<()> {
+        let dev = self.usbmux_device(udid).await?;
+        let provider = dev.to_provider(idevice::usbmuxd::UsbmuxdAddr::default(), LABEL);
+
+        ctx.stage("Checking the device");
+        let mut lockdown = with_timeout("Connecting to the device", LockdownClient::connect(&provider)).await?;
+        let pairing = provider.get_pairing_file().await.map_err(|_| FleetError::needs_user("Pair the device first: unlock it and tap Trust"))?;
+        with_timeout("Starting a session", lockdown.start_session(&pairing)).await?;
+
+        // A first backup needs roughly as much space as the device uses.
+        let capacity = disk_value(&mut lockdown, "TotalDataCapacity").await;
+        let available = disk_value(&mut lockdown, "TotalDataAvailable").await;
+        std::fs::create_dir_all(backup_root).map_err(|e| FleetError::permanent(format!("Can't create the backup folder: {e}")))?;
+        if let (Some(cap), Some(avail), Some(free)) = (capacity, available, backup::free_space(backup_root)) {
+            let used = cap.saturating_sub(avail);
+            let existing = backup::list_backups(backup_root).iter().filter(|b| b.folder == udid).map(|b| b.size).sum::<u64>();
+            let needed = used.saturating_sub(existing).saturating_add(512 << 20);
+            ctx.log(format!("Device uses {:.1} GB, {:.1} GB free on this computer", used as f64 / 1e9, free as f64 / 1e9));
+            if free < needed {
+                return Err(FleetError::permanent(format!(
+                    "Not enough disk space for the backup: about {:.1} GB needed, {:.1} GB free in {}",
+                    needed as f64 / 1e9,
+                    free as f64 / 1e9,
+                    backup_root.display()
+                )));
+            }
+        }
+        drop(lockdown);
+
+        ctx.stage("Starting the backup");
+        let mut client = tokio::time::timeout(LOCKDOWN_TIMEOUT, MobileBackup2Client::connect(&provider))
+            .await
+            .map_err(|_| FleetError::transient("The backup service didn't answer"))?
+            .map_err(|e| FleetError::from(e).context("Connecting to the backup service"))?;
+        let delegate = FleetDelegate::new(ctx.clone());
+        let cancel = ctx.cancellation();
+        let result = tokio::select! {
+            r = client.backup_from_path(backup_root, None, None, &delegate) => r,
+            _ = cancel.cancelled() => {
+                let _ = client.disconnect().await;
+                return Err(FleetError::cancelled());
+            }
+        };
+        let reply = result.map_err(|e| FleetError::from(e).context("Backup"))?;
+        if let Some(d) = reply
+            && let Some(code) = d.get("ErrorCode").and_then(|v| v.as_signed_integer())
+            && code != 0
+        {
+            let text = d.get("ErrorDescription").and_then(|v| v.as_string()).unwrap_or("unknown error");
+            return Err(match text {
+                t if t.to_lowercase().contains("passcode") || t.to_lowercase().contains("lock") => FleetError::needs_user(format!("Unlock the device and try again ({t})")),
+                t => FleetError::transient(format!("The device reported an error: {t} (code {code})")),
+            });
+        }
+        let _ = client.disconnect().await;
+        ctx.stage("Backup complete");
+        Ok(())
+    }
+
     pub async fn enter_recovery(&self, ctx: &JobContext, udid: &str, ecid: Option<u64>) -> Result<()> {
         let dev = self.usbmux_device(udid).await?;
         let provider = dev.to_provider(idevice::usbmuxd::UsbmuxdAddr::default(), LABEL);
@@ -235,6 +297,10 @@ impl NativeBackend {
         }
         Ok(())
     }
+}
+
+async fn disk_value(lockdown: &mut LockdownClient, key: &str) -> Option<u64> {
+    lockdown.get_value(Some(key), Some("com.apple.disk_usage")).await.ok().and_then(|v| v.as_unsigned_integer())
 }
 
 fn usbmuxd_down_message(e: &IdeviceError) -> String {

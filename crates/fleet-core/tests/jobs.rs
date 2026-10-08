@@ -252,3 +252,42 @@ fn submit_works_from_a_thread_outside_the_runtime() {
     rt.block_on(e.wait_idle());
     assert_eq!(e.get(&id).unwrap().state, JobState::Succeeded);
 }
+
+#[tokio::test(start_paused = true)]
+async fn attempts_that_make_progress_do_not_exhaust_the_retry_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(&dir);
+    let calls = Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    e.register(JobKind::Test, move |ctx: JobContext| {
+        let c = c.clone();
+        Box::pin(async move {
+            let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+            ctx.progress(n as f32 * 5.0); // forward progress every attempt
+            if n < 12 { Err(FleetError::transient("connection dropped")) } else { Ok(()) }
+        }) as RunnerFuture
+    });
+    let id = e.submit(spec(None, 3)).unwrap();
+    e.wait_idle().await;
+    assert_eq!(e.get(&id).unwrap().state, JobState::Succeeded);
+    assert_eq!(calls.load(Ordering::SeqCst), 12, "needed far more than max_attempts (3)");
+}
+
+#[tokio::test(start_paused = true)]
+async fn failures_without_progress_still_stop_at_max_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(&dir);
+    let calls = Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    e.register(JobKind::Test, move |_ctx: JobContext| {
+        let c = c.clone();
+        Box::pin(async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            Err(FleetError::transient("no luck"))
+        }) as RunnerFuture
+    });
+    let id = e.submit(spec(None, 3)).unwrap();
+    e.wait_idle().await;
+    assert_eq!(e.get(&id).unwrap().state, JobState::Failed);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}

@@ -12,7 +12,7 @@ use crate::devices::{Health, Registry};
 use crate::error::{FleetError, Result};
 use crate::firmware::{self, Catalog, DownloadParams, Firmware, LocalIpsw};
 use crate::jobs::{JobContext, JobEngine, JobId, JobKind, JobSpec, Limits, RetryPolicy, RunnerFuture};
-use crate::model::{Device, DeviceKey};
+use crate::model::{Device, DeviceKey, PairState};
 use crate::native::NativeBackend;
 use crate::store::Store;
 
@@ -70,6 +70,7 @@ pub struct Fleet {
     backend: Arc<NativeBackend>,
     runtime: tokio::runtime::Handle,
     library: Arc<Mutex<Vec<LocalIpsw>>>,
+    backups: Arc<Mutex<Vec<crate::backup::BackupEntry>>>,
     shutdown: CancellationToken,
     _instance_lock: File,
 }
@@ -97,8 +98,9 @@ impl Fleet {
         backend.start(shutdown.clone());
 
         let library = Arc::new(Mutex::new(Vec::new()));
-        let fleet = Self { engine, registry, paths, backend, runtime: tokio::runtime::Handle::current(), library, shutdown, _instance_lock: lock };
+        let fleet = Self { engine, registry, paths, backend, runtime: tokio::runtime::Handle::current(), library, backups: Arc::new(Mutex::new(Vec::new())), shutdown, _instance_lock: lock };
         fleet.refresh_library();
+        fleet.refresh_backups();
         fleet.register_runners();
         Ok(fleet)
     }
@@ -121,6 +123,19 @@ impl Fleet {
             Box::pin(async move {
                 let p: UdidParams = ctx.params()?;
                 b.pair(&ctx, &p.udid).await
+            }) as RunnerFuture
+        });
+        let (b, root, cache) = (self.backend.clone(), self.paths.backups.clone(), self.backups.clone());
+        self.engine.register(JobKind::Backup, move |ctx: JobContext| {
+            let (b, root, cache) = (b.clone(), root.clone(), cache.clone());
+            Box::pin(async move {
+                let p: UdidParams = ctx.params()?;
+                let r = b.backup(&ctx, &p.udid, &root).await;
+                let dir = root.clone();
+                if let Ok(found) = tokio::task::spawn_blocking(move || crate::backup::list_backups(&dir)).await {
+                    *cache.lock().unwrap_or_else(|p| p.into_inner()) = found;
+                }
+                r
             }) as RunnerFuture
         });
         let b = self.backend.clone();
@@ -210,6 +225,7 @@ impl Fleet {
     /// Changes whenever devices or jobs change.
     pub fn revision(&self) -> u64 {
         self.registry.revision().wrapping_add(self.engine.revision()).wrapping_add(self.library().len() as u64 * 1_000_003)
+            .wrapping_add(self.backups().len() as u64 * 7_000_001)
     }
 
     fn device(&self, key: &DeviceKey) -> Result<Device> {
@@ -229,6 +245,30 @@ impl Fleet {
         let spec = JobSpec::new(JobKind::Pair, format!("Pair {}", d.label()), Some(key.clone()), RetryPolicy::quick())
             .with_params(UdidParams { udid, ecid: d.ecid });
         self.engine.submit(spec)
+    }
+
+    pub fn backup(&self, key: &DeviceKey) -> Result<JobId> {
+        let d = self.device(key)?;
+        let udid = self.normal_udid(key)?;
+        if d.pair_state != PairState::Paired {
+            return Err(FleetError::needs_user("Trust this computer first: unlock the device, tap Trust, then use the Trust button"));
+        }
+        let spec = JobSpec::new(JobKind::Backup, format!("Back up {}", d.label()), Some(key.clone()), RetryPolicy::long()).with_params(UdidParams { udid, ecid: d.ecid });
+        self.engine.submit(spec)
+    }
+
+    /// Cached list; call `refresh_backups` to update it.
+    pub fn backups(&self) -> Vec<crate::backup::BackupEntry> {
+        self.backups.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Rescan the backup folder in the background (sizing large folders is slow).
+    pub fn refresh_backups(&self) {
+        let (dir, cache) = (self.paths.backups.clone(), self.backups.clone());
+        self.runtime.spawn_blocking(move || {
+            let found = crate::backup::list_backups(&dir);
+            *cache.lock().unwrap_or_else(|p| p.into_inner()) = found;
+        });
     }
 
     pub fn enter_recovery(&self, key: &DeviceKey) -> Result<JobId> {

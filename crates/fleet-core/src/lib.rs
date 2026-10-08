@@ -1,6 +1,7 @@
 //! iDevice Fleet core: device tracking, supervised jobs and persistence.
 //! Has no UI code so all of it can be tested headless.
 
+pub mod backup;
 pub mod devices;
 pub mod error;
 pub mod firmware;

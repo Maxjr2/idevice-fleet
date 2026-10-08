@@ -164,6 +164,8 @@ struct JobShared {
     last_activity_ms: AtomicU64,
     dirty: AtomicBool,
     revision: Arc<AtomicU64>,
+    /// Set when the running attempt reported forward progress.
+    progressed: AtomicBool,
 }
 
 impl JobShared {
@@ -222,7 +224,14 @@ impl JobContext {
     }
     /// Percent, 0–100.
     pub fn progress(&self, percent: f32) {
-        self.shared.view().progress = Some(percent.clamp(0.0, 100.0));
+        let percent = percent.clamp(0.0, 100.0);
+        {
+            let mut v = self.shared.view();
+            if v.progress.is_none_or(|old| percent > old) {
+                self.shared.progressed.store(true, Ordering::Relaxed);
+            }
+            v.progress = Some(percent);
+        }
         self.shared.touch();
         self.shared.changed();
     }
@@ -337,6 +346,7 @@ impl JobEngine {
                 last_activity_ms: AtomicU64::new(0),
                 dirty: AtomicBool::new(false),
                 revision: revision.clone(),
+                progressed: AtomicBool::new(false),
             });
             lock(&inner.jobs).insert(view.id.clone(), shared);
         }
@@ -409,6 +419,7 @@ impl JobEngine {
             last_activity_ms: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             revision: self.inner.revision.clone(),
+            progressed: AtomicBool::new(false),
         });
         if let Err(e) = self.inner.store.save_job(&view, &spec) {
             if let Some(dev) = &spec.device {
@@ -562,9 +573,16 @@ async fn supervise(inner: Arc<EngineInner>, shared: Arc<JobShared>, spec: JobSpe
         persist(&inner, &shared, &spec);
     };
 
+    // Attempts that made progress don't count against `max_attempts`: a 10 GB
+    // download over a flaky link can legitimately need dozens of resumes. A hard
+    // cap still stops a job that keeps failing after each tiny step forward.
+    const HARD_CAP: u32 = 60;
     let mut attempt = 0;
+    let mut total_attempts = 0u32;
     loop {
         attempt += 1;
+        total_attempts += 1;
+        shared.progressed.store(false, Ordering::Relaxed);
         {
             let mut v = shared.view();
             v.attempt = attempt;
@@ -597,8 +615,8 @@ async fn supervise(inner: Arc<EngineInner>, shared: Arc<JobShared>, spec: JobSpe
             v.stage = None;
             v.error = None;
         }
-        if attempt > 1 {
-            shared.log_line(&format!("Attempt {attempt} of {max_attempts}"));
+        if total_attempts > 1 {
+            shared.log_line(&format!("Attempt {total_attempts}"));
         }
         persist(&inner, &shared, &spec);
         shared.touch();
@@ -648,9 +666,13 @@ async fn supervise(inner: Arc<EngineInner>, shared: Arc<JobShared>, spec: JobSpe
                 finish(JobState::Cancelled, None);
                 break;
             }
-            Err(e) if e.is_retryable() && attempt < max_attempts => {
-                let delay = policy.delay(attempt);
-                shared.log_line(&format!("Attempt {attempt} failed: {e}. Retrying in {}s", delay.as_secs()));
+            Err(e) if e.is_retryable() && (attempt < max_attempts || (shared.progressed.load(Ordering::Relaxed) && total_attempts < HARD_CAP)) => {
+                if attempt >= max_attempts {
+                    // Progress was made: start the count over.
+                    attempt = 0;
+                }
+                let delay = policy.delay(attempt.max(1));
+                shared.log_line(&format!("Attempt {total_attempts} failed: {e}. Retrying in {}s", delay.as_secs()));
                 {
                     let mut v = shared.view();
                     v.state = JobState::Retrying;

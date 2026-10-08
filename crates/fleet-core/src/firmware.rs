@@ -50,7 +50,7 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
-        .timeout_recv_body(Some(Duration::from_secs(60)))
+        .timeout_recv_body(Some(Duration::from_secs(180)))
         .http_status_as_error(false)
         .user_agent("idevice-fleet")
         .build()
@@ -224,56 +224,30 @@ pub fn download_unchecked(ctx: &JobContext, p: &DownloadParams, name: &str) -> R
         }
     }
 
-    let mut req = agent().get(&p.url);
-    if have > 0 {
-        req = req.header("Range", &format!("bytes={have}-"));
-    }
-    let mut resp = req.call().map_err(net_err)?;
-    let status = resp.status().as_u16();
-    if status == 416 && p.size == Some(have) {
-        // Already complete; fall through to verification.
-    } else if status == 200 && have > 0 {
-        ctx.log("The server ignored the resume request, starting over");
-        have = 0;
-        hasher = Sha256::new();
-    } else if status != 200 && status != 206 && !(status == 416) {
-        return Err(status_err(status, "Download"));
-    }
-
-    let remaining: u64 = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let total = p.size.unwrap_or(have + remaining).max(have + remaining);
-    ctx.log(format!("{name}: {:.2} GB{}", total as f64 / 1e9, if have > 0 { format!(", resuming at {:.2} GB", have as f64 / 1e9) } else { String::new() }));
-    ctx.stage("Downloading");
-
-    if status != 416 {
-        let mut out = OpenOptions::new().create(true).write(true).append(have > 0).truncate(have == 0).open(&part)?;
-        let mut body = resp.body_mut().as_reader();
-        let mut buf = vec![0u8; 256 * 1024];
-        let mut done = have;
-        let mut last = std::time::Instant::now();
-        loop {
-            ctx.check_cancelled()?;
-            let n = body.read(&mut buf).map_err(|e| FleetError::transient(format!("Download interrupted: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n]).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::StorageFull { FleetError::permanent("The disk is full") } else { e.into() }
-            })?;
-            hasher.update(&buf[..n]);
-            done += n as u64;
-            if last.elapsed() > Duration::from_millis(400) {
-                if total > 0 {
-                    ctx.progress(done as f32 / total as f32 * 100.0);
-                }
-                ctx.heartbeat();
-                last = std::time::Instant::now();
-            }
+    // Apple's CDN often drops long transfers. Reconnect and resume right away
+    // while each connection makes progress; give up after repeated dead ends.
+    let mut dead_ends = 0u32;
+    let mut reconnects = 0u32;
+    loop {
+        ctx.check_cancelled()?;
+        let before = have;
+        match stream_once(ctx, p, &part, name, &mut have, &mut hasher) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(e) if e.is_retryable() => ctx.log(e.message.as_str()),
+            Err(e) => return Err(e),
         }
-        out.flush()?;
-        if total > 0 && done < total {
-            return Err(FleetError::transient(format!("The download ended early ({:.2} of {:.2} GB); it will resume", done as f64 / 1e9, total as f64 / 1e9)));
+        if have > before {
+            dead_ends = 0;
+        } else {
+            dead_ends += 1;
         }
+        reconnects += 1;
+        if dead_ends >= 5 {
+            return Err(FleetError::transient("The server keeps dropping the connection without sending data"));
+        }
+        ctx.log(format!("Connection dropped at {:.2} GB, reconnecting (#{reconnects})", have as f64 / 1e9));
+        interruptible_sleep(ctx, Duration::from_millis(if dead_ends == 0 { 300 } else { 2000 * dead_ends as u64 }))?;
     }
 
     if let Some(expected) = &p.sha256 {
@@ -289,6 +263,75 @@ pub fn download_unchecked(ctx: &JobContext, p: &DownloadParams, name: &str) -> R
     ctx.progress(100.0);
     ctx.stage("In the library");
     Ok(())
+}
+
+fn interruptible_sleep(ctx: &JobContext, d: Duration) -> Result<()> {
+    let end = std::time::Instant::now() + d;
+    while std::time::Instant::now() < end {
+        ctx.check_cancelled()?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// One connection: request from `have`, append to the part file, update the
+/// hash. Returns true when the whole file has arrived, false if the server
+/// ended the transfer early. `have` always reflects what is safely on disk.
+fn stream_once(ctx: &JobContext, p: &DownloadParams, part: &Path, name: &str, have: &mut u64, hasher: &mut Sha256) -> Result<bool> {
+    let mut req = agent().get(&p.url);
+    if *have > 0 {
+        req = req.header("Range", &format!("bytes={have}-", have = *have));
+    }
+    let mut resp = req.call().map_err(net_err)?;
+    let status = resp.status().as_u16();
+    if status == 416 && p.size == Some(*have) {
+        return Ok(true);
+    }
+    if status == 200 && *have > 0 {
+        ctx.log("The server ignored the resume request, starting over");
+        *have = 0;
+        *hasher = Sha256::new();
+    } else if status != 200 && status != 206 {
+        return Err(status_err(status, "Download"));
+    }
+    let remaining: u64 = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let total = p.size.unwrap_or(*have + remaining).max(*have + remaining);
+    if *have == 0 {
+        ctx.log(format!("{name}: {:.2} GB", total as f64 / 1e9));
+    }
+    ctx.stage("Downloading");
+
+    let mut out = OpenOptions::new().create(true).write(true).append(*have > 0).truncate(*have == 0).open(part)?;
+    let mut body = resp.body_mut().as_reader();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut last = std::time::Instant::now();
+    loop {
+        ctx.check_cancelled()?;
+        let n = match body.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                out.flush()?;
+                return Err(FleetError::transient(format!("Download interrupted: {e}")));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n]).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::StorageFull { FleetError::permanent("The disk is full") } else { e.into() }
+        })?;
+        hasher.update(&buf[..n]);
+        *have += n as u64;
+        if last.elapsed() > Duration::from_millis(400) {
+            if total > 0 {
+                ctx.progress(*have as f32 / total as f32 * 100.0);
+            }
+            ctx.heartbeat();
+            last = std::time::Instant::now();
+        }
+    }
+    out.flush()?;
+    Ok(total == 0 || *have >= total)
 }
 
 /// Group helper for the UI: which catalog builds are already local.
