@@ -1,5 +1,9 @@
 # iDevice Fleet
 
+> **This is the original Python web version.** It restores through `idevicerestore` and needs the libimobiledevice
+> command-line tools. The actively developed desktop app, written in Rust, lives on
+> [`main`](https://github.com/Maxjr2/idevice-fleet).
+
 A local web UI for restoring, backing up and re-provisioning many iPhones and iPads at once, built on the
 [libimobiledevice](https://libimobiledevice.org) tools. No Mac needed.
 
