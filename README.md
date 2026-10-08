@@ -24,7 +24,8 @@ sudo apt install ./idevice-fleet_0.2.0_amd64.deb
 ```
 
 This pulls in `usbmuxd`, installs the udev rule for recovery and DFU mode, and adds iDevice Fleet to your
-application menu. `idevicerestore` is recommended, not required.
+application menu. `idevicerestore` is recommended, not required. The package is built on Ubuntu 26.04 and needs
+glibc 2.43 or newer, so older distributions should [build from source](#build-from-source).
 
 **Updates come the same way.** On startup the app checks the latest release on GitHub. When there is a newer
 one, a banner shows what changed, with **Download update**, which fetches the `.deb` and checks it against the

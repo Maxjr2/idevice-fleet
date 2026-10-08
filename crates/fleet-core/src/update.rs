@@ -248,7 +248,10 @@ mod tests {
     #[test]
     #[ignore]
     fn live_check() {
-        let r = check("0.0.1");
-        assert!(r.is_ok(), "{r:?}");
+        // An old version must be told about the published release, a current one must not.
+        let info = check("0.0.1").unwrap().expect("a newer release exists");
+        assert!(info.deb_url.is_some() && info.sums_url.is_some(), "{info:?}");
+        check_update_url(info.deb_url.as_deref().unwrap()).unwrap();
+        assert!(check("99.0.0").unwrap().is_none());
     }
 }
