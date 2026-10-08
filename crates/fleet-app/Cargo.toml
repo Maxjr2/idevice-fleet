@@ -1,0 +1,20 @@
+[package]
+name = "fleet-app"
+description = "iDevice Fleet desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "idevice-fleet"
+path = "src/main.rs"
+
+[dependencies]
+fleet-core = { path = "../fleet-core" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+directories.workspace = true
+eframe.workspace = true
+egui_extras.workspace = true

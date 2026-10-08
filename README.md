@@ -1,113 +1,61 @@
 # iDevice Fleet
 
-A local web UI for restoring, backing up and re-provisioning many iPhones and iPads at once, built on the
-[libimobiledevice](https://libimobiledevice.org) tools. No Mac needed.
+A desktop app for restoring, backing up and re-provisioning many iPhones and iPads at once. No Mac needed.
+Written in Rust on top of the pure-Rust [`idevice`](https://github.com/jkcoxson/idevice) crate, with an
+[egui](https://github.com/emilk/egui) interface.
 
-It was written for MDM migrations: wiping a few dozen company iPads with firmware you downloaded beforehand,
-several at a time, and keeping track of each one while it moves between normal, recovery and DFU mode.
+> **Status: work in progress (Linux first).** The Python web version is still available as tag
+> [`v0.1-python`](https://github.com/Maxjr2/idevice-fleet/tree/v0.1-python).
 
-![Devices view](docs/screenshot.png)
+| | Status |
+|---|---|
+| Device list across normal / recovery / DFU mode, tracked by ECID | ✅ |
+| Pair (trust), enter recovery, exit recovery | ✅ |
+| Job engine: retries, watchdog, crash recovery, logs | ✅ |
+| Firmware library: signed-version lookup, resumable verified downloads | planned |
+| Backups (mobilebackup2) | planned |
+| Firmware restore (native, with `idevicerestore` as per-job fallback) | planned |
+| Windows | later |
 
-## What it does
+## Built to keep going
 
-- **Device list across modes.** Devices are tracked by ECID, so an iPad keeps its name and serial number while it
-  reboots into recovery or DFU mode during a restore.
-- **Parallel firmware restores** with `idevicerestore`: erase-restore or update, one job per device, up to
-  `--max-restores` at the same time (default 4). Each job shows its step and progress, and keeps a full log.
-- **Firmware library with preloading.** Look up a model on [ipsw.me](https://ipsw.me), see which versions Apple
-  still signs, and download them in advance. Downloads resume after an interruption and are checked against
-  their SHA-256 before they're added to the library. You can also drop `.ipsw` files into the library folder.
-- **Backups** with `idevicebackup2`: full backups, turning backup encryption on or off, and restoring a backup to
-  the same device or to a replacement.
-- **Recovery mode**: enter it from normal mode, or kick a device out of a recovery loop.
-- **Pairing**: trust the computer from the UI before backing up.
+- **Every device operation is a job** that runs in its own task. If one device's job hits a bug, that job
+  fails and everything else keeps running.
+- **Retries that make sense.** Failures are sorted into *temporary* (USB hiccup, device rebooting, usbmuxd
+  restarting, Apple's servers unreachable), *needs you* (unlock the device, tap Trust), *permanent* and
+  *cancelled*. Only temporary failures are retried, with growing delays between attempts.
+- **Watchdog.** An attempt that reports no progress for too long is cancelled and retried, so a hung
+  restore doesn't sit there forever.
+- **Survives crashes and restarts.** Jobs are saved in SQLite (WAL mode). After a crash or reboot, a job that
+  was running shows up as *Interrupted* with a **Run again** button. Every job writes its own log file as it goes.
+- **One job per device** and a limit on parallel restores. Only one copy of the app can use a data folder.
+- **Devices don't vanish mid-job.** A device rebooting between restore stages stays listed as *Reconnecting*,
+  keeping its name and serial.
+- **Self-healing device watchers.** The usbmuxd connection reconnects when usbmuxd restarts. Recovery and DFU
+  devices are found by reading USB descriptors only, which never interferes with a running restore.
 
-Nothing leaves your machine except the ipsw.me catalog lookup, firmware downloads from Apple's CDN, and the
-signing request `idevicerestore` itself sends to Apple during a restore.
-
-## Requirements
-
-- Python 3.9 or newer. No other Python packages needed.
-- The libimobiledevice command-line tools: `idevice_id`, `ideviceinfo`, `idevicepair`, `idevicebackup2`,
-  `ideviceenterrecovery`, `idevicerestore` and `irecovery`. The UI shows which ones it found.
-- Internet access during restores: Apple has to sign every restore, so firmware Apple no longer signs can't be
-  installed.
-- Disk space: one iPad firmware file is 7–10 GB, and each running restore uses its own temporary cache folder.
-
-### Linux (Debian / Ubuntu)
-
-```bash
-sudo apt install libimobiledevice-utils idevicerestore usbmuxd
-```
-
-If you built libimobiledevice from source with `--prefix=/opt/local`, the tools in `/opt/local/bin` are found
-automatically.
-
-### Windows
-
-Run it **natively on Windows, not in WSL** (see below).
-
-1. Install Apple's **Apple Devices** app (or iTunes) from the Microsoft Store. It provides the USB drivers and the
-   Apple Mobile Device Service the tools need.
-2. Install [MSYS2](https://www.msys2.org), open the *UCRT64* shell and install the tools:
-   ```bash
-   pacman -S mingw-w64-ucrt-x86_64-libimobiledevice mingw-w64-ucrt-x86_64-idevicerestore
-   ```
-3. Start iDevice Fleet with `--tools-dir C:\msys64\ucrt64\bin`.
-
-On Windows, devices that are already in recovery or DFU mode are detected one at a time through `irecovery`.
-Devices you connect in normal mode first are remembered by ECID, so restoring them works as usual.
-
-### Why not WSL?
-
-WSL2 has no direct USB access, so iOS devices have to be forwarded with
-[usbipd-win](https://github.com/dorssel/usbipd-win). Backups and device info can work that way, but restores
-don't work reliably: the device disconnects and reconnects with a new USB ID every time it changes mode, and
-large firmware transfers fail
-([usbipd-win#959](https://github.com/dorssel/usbipd-win/issues/959)).
-
-## Run it
+## Build and run (Linux)
 
 ```bash
-git clone https://github.com/Maxjr2/idevice-fleet
-cd idevice-fleet
-python3 -m idevice_fleet
+sudo apt install usbmuxd build-essential
+cargo run --release -p fleet-app
 ```
 
-It opens `http://127.0.0.1:8765` in your browser. Options:
-
-| Option | Default | |
-|---|---|---|
-| `--data DIR` | `~/idevice-fleet` | Firmware library, backups, logs and restore cache |
-| `--port N` | `8765` | Local port |
-| `--tools-dir DIR` | | Folder with the libimobiledevice tools, if they aren't on PATH |
-| `--max-restores N` | `4` | Restores that run at the same time |
-| `--no-browser` | | Don't open a browser |
-
-The server only listens on `127.0.0.1`. It rejects requests that don't name localhost as their host, and write
-requests have to carry a custom header, so other websites can't drive it from your browser.
-
-## A restore, step by step
-
-1. **Firmware tab:** look up the model identifier (for example `iPad13,18`; the devices you connect are
-   suggested) and download the signed version.
-2. **Devices tab:** connect the devices. Select them and choose **Restore selected**. The newest matching
-   firmware is preselected for each device.
-3. Choose **Erase** (full restore) or **Update** (keeps data), type the confirmation word and start.
-4. Watch progress in **Jobs**. If a job fails, open its log. The full `idevicerestore` log is also saved in the
-   `logs` folder.
-
-Activation Lock is still enforced after an erase. Turn off Find My first, or have your MDM's bypass code ready.
-
-## Development
+To use recovery and DFU mode without root, install the udev rule:
 
 ```bash
-python3 -m unittest discover -s tests
+sudo cp packaging/linux/70-idevice-fleet.rules /etc/udev/rules.d/ && sudo udevadm control --reload
 ```
 
-The tests cover the output parsers, the firmware library and the backup reader, and need no device.
+Data lives in `~/.local/share/idevice-fleet` (database, logs, firmware, backups). Use `--data DIR` or
+`IDEVICE_FLEET_DATA` to put it elsewhere, for example on an external drive.
+
+## Layout
+
+- `crates/fleet-core`: everything except the UI: job engine, persistence, device registry, the `idevice` backend.
+  Testable without a device: `cargo test -p fleet-core`.
+- `crates/fleet-app`: the egui desktop app.
 
 ## License
 
-MIT. libimobiledevice, idevicerestore and libirecovery are separate projects with their own licenses. iDevice
-Fleet only runs their command-line tools.
+MIT. Recovery-mode USB transport adapted from the idevice project's examples (MIT).

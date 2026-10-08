@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/fleet-core", "crates/fleet-app"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Maxjr2/idevice-fleet"
+
+[workspace.dependencies]
+idevice = { version = "=0.1.68", default-features = false, features = ["ring", "usbmuxd", "pair", "restore", "restore_recovery", "tss", "mobilebackup2", "preboard_service", "heartbeat", "diagnostics_relay"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "signal"] }
+tokio-util = "0.7"
+futures = "0.3"
+nusb = { version = "0.2.7", features = ["tokio"] }
+plist = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+directories = "6"
+uuid = { version = "1", features = ["v4"] }
+eframe = "0.36"
+egui_extras = "0.36"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+
+[profile.release]
+lto = "thin"

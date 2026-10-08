@@ -1,0 +1,4 @@
+# Let the logged-in user open Apple devices in recovery (0x1280-0x1283), DFU (0x1227)
+# and WTF (0x1222) mode, which iDevice Fleet talks to directly over USB.
+# Install:  sudo cp 70-idevice-fleet.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="128[0-3]|1227|1222", TAG+="uaccess"
