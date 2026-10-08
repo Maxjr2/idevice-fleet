@@ -236,3 +236,19 @@ fn backoff_grows_and_is_capped() {
     assert_eq!(p.delay(4), Duration::from_secs(8));
     assert_eq!(p.delay(9), Duration::from_secs(30));
 }
+
+/// The UI thread has no Tokio runtime; submitting from it must still work.
+#[test]
+fn submit_works_from_a_thread_outside_the_runtime() {
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let e = {
+        let _g = rt.enter();
+        engine(&dir)
+    };
+    e.register(JobKind::Test, |_ctx: JobContext| Box::pin(async { Ok(()) }) as RunnerFuture);
+    let e2 = e.clone();
+    let id = std::thread::spawn(move || e2.submit(spec(Some("dev"), 1)).unwrap()).join().unwrap();
+    rt.block_on(e.wait_idle());
+    assert_eq!(e.get(&id).unwrap().state, JobState::Succeeded);
+}

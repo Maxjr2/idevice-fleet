@@ -282,6 +282,8 @@ struct EngineInner {
     revision: Arc<AtomicU64>,
     shutdown: CancellationToken,
     grace: Duration,
+    /// Jobs are submitted from the UI thread, which isn't inside the runtime.
+    runtime: tokio::runtime::Handle,
 }
 
 #[derive(Clone)]
@@ -314,6 +316,7 @@ impl JobEngine {
             revision: revision.clone(),
             shutdown: CancellationToken::new(),
             grace: Duration::from_secs(15),
+            runtime: tokio::runtime::Handle::current(),
         });
 
         for (mut view, spec) in store.load_jobs(500)? {
@@ -418,7 +421,7 @@ impl JobEngine {
         lock(&self.inner.cancels).insert(id.clone(), cancel.clone());
         shared.changed();
         shared.log_line(&format!("Job created: {}", spec.title));
-        tokio::spawn(supervise(self.inner.clone(), shared, spec, cancel));
+        self.inner.runtime.spawn(supervise(self.inner.clone(), shared, spec, cancel));
         Ok(id)
     }
 
