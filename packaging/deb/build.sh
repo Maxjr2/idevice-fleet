@@ -28,6 +28,7 @@ v = sys.argv[1]
 print(f"idevice-fleet ({v}) stable; urgency=medium\n\n  * See https://github.com/Maxjr2/idevice-fleet/releases/tag/v{v}\n\n -- Maximilian Erkens <max@erkens.net>  Thu, 08 Oct 2026 12:00:00 +0000")
 PY
 gzip -9n -c "$STAGE/changelog" > "$STAGE/usr/share/doc/$PKG/changelog.gz" && rm "$STAGE/changelog"
+chmod 644 "$STAGE"/usr/share/doc/$PKG/*
 
 # The oldest glibc the binary needs.
 GLIBC=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 | sed 's/GLIBC_//')
