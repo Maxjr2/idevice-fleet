@@ -63,6 +63,29 @@ pub fn load(fleet: &Fleet) -> Result<()> {
         }) as RunnerFuture
     });
 
+    // Simulated restores: the whole flow is visible without a device.
+    fleet.engine.register(JobKind::Restore, |ctx: JobContext| {
+        Box::pin(async move {
+            let p: crate::restore::RestoreParams = ctx.params()?;
+            let secs: f32 = std::env::var("IDEVICE_FLEET_DEMO_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(40.0);
+            let start = 20.0 + (p.ecid % 40) as f32;
+            let stages = [(0.0, "Unpacking the system image"), (0.15, "Asking Apple to approve the restore"), (0.3, "Starting the restore on the device"), (0.45, "Restoring (step 15)"), (0.8, "Flashing firmware")];
+            let steps = 100;
+            for i in 0..=steps {
+                let f = i as f32 / steps as f32;
+                ctx.heartbeat();
+                let stage = stages.iter().rev().find(|(t, _)| f >= *t).map(|(_, s)| *s).unwrap_or("Starting");
+                ctx.stage_quiet(stage);
+                ctx.progress(if secs < 10.0 { f * 100.0 } else { start + (100.0 - start) * f });
+                if i == 70 && p.ecid % 2 == 1 {
+                    return Err(FleetError::permanent("The device stopped answering while it was being restored. Check the cable, use one plugged straight into the computer"));
+                }
+                ctx.sleep(Duration::from_secs_f32(secs / steps as f32)).await?;
+            }
+            Ok(())
+        }) as RunnerFuture
+    });
+
     for (i, d) in DEVICES.iter().enumerate() {
         fleet.registry.normal_attached(d.udid, i as u32 + 1);
         fleet.registry.normal_info(

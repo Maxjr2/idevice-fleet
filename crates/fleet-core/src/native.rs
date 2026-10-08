@@ -157,6 +157,10 @@ impl NativeBackend {
         }
     }
 
+    pub async fn usbmux_device_pub(&self, udid: &str) -> Result<UsbmuxdDevice> {
+        self.usbmux_device(udid).await
+    }
+
     async fn usbmux_device(&self, udid: &str) -> Result<UsbmuxdDevice> {
         let mut conn = UsbmuxdConnection::default().await.map_err(|e| FleetError::transient(usbmuxd_down_message(&e)))?;
         conn.get_device(udid).await.map_err(|_| FleetError::transient("The device isn't connected in normal mode"))
@@ -329,6 +333,9 @@ async fn read_info(dev: &UsbmuxdDevice) -> Result<NormalInfo> {
                 info = parse_lockdown(&full);
             }
             info.paired = true;
+            if let Ok(v) = with_timeout("Reading Find My status", lockdown.get_value(Some("IsAssociated"), Some("com.apple.fmip"))).await {
+                info.find_my = v.as_boolean();
+            }
             if let Ok(v) = with_timeout("Reading battery", lockdown.get_value(Some("BatteryCurrentCapacity"), Some("com.apple.mobile.battery"))).await {
                 info.battery_percent = v.as_unsigned_integer().map(|b| b.min(100) as u8);
             }
@@ -351,6 +358,7 @@ pub fn parse_lockdown(v: &Value) -> NormalInfo {
         serial: s("SerialNumber"),
         activation_state: s("ActivationState"),
         battery_percent: None,
+        find_my: None,
         paired: false,
     }
 }

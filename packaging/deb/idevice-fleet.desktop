@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=iDevice Fleet
+GenericName=iPhone and iPad management
+Comment=Reset, back up and re-provision many iPhones and iPads at once
+Exec=idevice-fleet
+Icon=idevice-fleet
+Terminal=false
+Categories=Utility;System;
+Keywords=iPhone;iPad;iOS;restore;backup;recovery;DFU;MDM;
+StartupWMClass=idevice-fleet

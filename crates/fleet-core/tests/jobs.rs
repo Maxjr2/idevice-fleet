@@ -291,3 +291,68 @@ async fn failures_without_progress_still_stop_at_max_attempts() {
     assert_eq!(e.get(&id).unwrap().state, JobState::Failed);
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
+
+#[tokio::test(start_paused = true)]
+async fn cancel_works_in_every_state() {
+    // Queued: waiting for a restore slot.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&dir.path().join("fleet.db")).unwrap());
+    let e = JobEngine::new(store, dir.path().join("logs"), Limits { restores: 1, downloads: 1, other: 4 }).unwrap();
+    e.register(JobKind::Restore, |ctx: JobContext| {
+        Box::pin(async move {
+            loop {
+                ctx.heartbeat();
+                ctx.sleep(Duration::from_secs(1)).await?;
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        }) as RunnerFuture
+    });
+    let mk = |d: &str| JobSpec::new(JobKind::Restore, "restore", Some(DeviceKey(d.into())), policy(1));
+    let running = e.submit(mk("a")).unwrap();
+    let queued = e.submit(mk("b")).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(e.get(&queued).unwrap().state, JobState::Queued);
+    assert!(e.cancel(&queued));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(e.get(&queued).unwrap().state, JobState::Cancelled, "a queued job cancels at once");
+    assert!(e.cancel(&running));
+    e.wait_idle().await;
+    assert_eq!(e.get(&running).unwrap().state, JobState::Cancelled);
+
+    // Retrying: waiting out a backoff delay.
+    let e2 = engine(&dir);
+    e2.register(JobKind::Test, |_ctx: JobContext| Box::pin(async { Err(FleetError::transient("again")) }) as RunnerFuture);
+    let long = RetryPolicy { max_attempts: 5, base_delay_ms: 3_600_000, max_delay_ms: 3_600_000, stall_timeout_s: 30, attempt_timeout_s: None };
+    let id = e2.submit(JobSpec::new(JobKind::Test, "t", None, long)).unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(e2.get(&id).unwrap().state, JobState::Retrying);
+    assert!(e2.cancel(&id));
+    e2.wait_idle().await;
+    assert_eq!(e2.get(&id).unwrap().state, JobState::Cancelled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_returns_promptly_even_if_the_runner_ignores_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(&dir);
+    // A runner stuck in something that never looks at the cancellation token.
+    e.register(JobKind::Test, |ctx: JobContext| {
+        Box::pin(async move {
+            loop {
+                ctx.heartbeat();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        }) as RunnerFuture
+    });
+    let id = e.submit(spec(Some("dev"), 3)).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let t0 = tokio::time::Instant::now();
+    assert!(e.cancel(&id));
+    e.wait_idle().await;
+    assert_eq!(e.get(&id).unwrap().state, JobState::Cancelled);
+    assert!(t0.elapsed() <= Duration::from_secs(20), "aborted after the grace period");
+    assert!(e.busy_devices().is_empty());
+}

@@ -2,6 +2,7 @@
 
 mod theme;
 mod ui;
+mod wizard;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,7 +63,29 @@ fn init_logging(dir: &std::path::Path) -> Option<tracing_appender::non_blocking:
     }
 }
 
+const HELP: &str = "iDevice Fleet: reset, back up and re-provision many iPhones and iPads
+
+Usage: idevice-fleet [OPTIONS]
+
+Options:
+  --data DIR           Where the database, logs, firmware and backups live
+                       (default: ~/.local/share/idevice-fleet, or $IDEVICE_FLEET_DATA)
+  --demo               Show invented devices and jobs; don't touch USB
+  --theme light|dark   Override the system theme
+  --no-update-check    Don't look for new releases on GitHub at startup
+  --version            Print the version
+  --help               Print this help
+";
+
 fn main() -> eframe::Result {
+    if has_flag("version") || std::env::args().nth(1).as_deref() == Some("-V") {
+        println!("idevice-fleet {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if has_flag("help") || std::env::args().nth(1).as_deref() == Some("-h") {
+        print!("{HELP}");
+        return Ok(());
+    }
     let data = data_dir();
     let _log_guard = init_logging(&data.join("logs"));
 
@@ -77,7 +100,7 @@ fn main() -> eframe::Result {
 
     let started = {
         let _guard = runtime.enter();
-        Fleet::start(Config { data_dir: data.clone(), limits: Limits::default(), demo: has_flag("demo") })
+        Fleet::start(Config { data_dir: data.clone(), limits: Limits::default(), demo: has_flag("demo"), check_updates: !has_flag("no-update-check") })
     };
 
     let (w, h) = arg("size").and_then(|s| s.split_once('x').map(|(w, h)| (w.parse().unwrap_or(1180.0), h.parse().unwrap_or(760.0)))).unwrap_or((1180.0, 760.0));
@@ -87,6 +110,8 @@ fn main() -> eframe::Result {
         lookup: arg("lookup"),
         theme: arg("theme"),
         select_job: has_flag("demo"),
+        wizard: arg("wizard"),
+        wait: arg("wait").and_then(|w| w.parse().ok()).unwrap_or(0.0),
     };
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

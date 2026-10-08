@@ -37,6 +37,8 @@ pub enum JobKind {
     Backup,
     Restore,
     Download,
+    /// Installing an app update.
+    Install,
     /// Used by tests.
     Test,
 }
@@ -152,6 +154,9 @@ pub struct JobView {
     pub finished_at: Option<u64>,
     pub next_retry_at: Option<u64>,
     pub retry_of: Option<JobId>,
+    /// Cancel was requested; the job is stopping.
+    #[serde(default)]
+    pub cancelling: bool,
 }
 
 const LOG_RING: usize = 2000;
@@ -221,6 +226,17 @@ impl JobContext {
         self.shared.log_line(&stage);
         self.shared.view().stage = Some(stage);
         self.shared.changed();
+    }
+    /// Update the stage shown without adding a log line (for fast-changing progress).
+    pub fn stage_quiet(&self, stage: impl Into<String>) {
+        let stage = stage.into();
+        let mut v = self.shared.view();
+        if v.stage.as_deref() != Some(stage.as_str()) {
+            v.stage = Some(stage);
+            drop(v);
+            self.shared.changed();
+        }
+        self.shared.touch();
     }
     /// Percent, 0–100.
     pub fn progress(&self, percent: f32) {
@@ -409,6 +425,7 @@ impl JobEngine {
             finished_at: None,
             next_retry_at: None,
             retry_of,
+            cancelling: false,
         };
         let log_file = OpenOptions::new().create(true).append(true).open(self.inner.log_dir.join(format!("{id}.log"))).ok();
         let shared = Arc::new(JobShared {
@@ -454,13 +471,17 @@ impl JobEngine {
     }
 
     pub fn cancel(&self, id: &str) -> bool {
-        match lock(&self.inner.cancels).get(id) {
-            Some(token) => {
-                token.cancel();
-                true
-            }
-            None => false,
+        let token = lock(&self.inner.cancels).get(id).cloned();
+        let Some(token) = token else { return false };
+        if let Some(job) = lock(&self.inner.jobs).get(id).cloned()
+            && !token.is_cancelled()
+        {
+            job.view().cancelling = true;
+            job.log_line("Cancel requested");
+            job.changed();
         }
+        token.cancel();
+        true
     }
 
     pub fn get(&self, id: &str) -> Option<JobView> {

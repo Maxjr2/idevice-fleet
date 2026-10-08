@@ -29,6 +29,7 @@ pub struct NormalInfo {
     pub serial: Option<String>,
     pub activation_state: Option<String>,
     pub battery_percent: Option<u8>,
+    pub find_my: Option<bool>,
     pub paired: bool,
 }
 
@@ -211,6 +212,7 @@ impl Registry {
                 serial: info.serial.or_else(|| known.and_then(|k| k.serial.clone())),
                 activation_state: info.activation_state,
                 battery_percent: info.battery_percent,
+                find_my: info.find_my,
                 pair_state: match &e.info {
                     None => PairState::Unknown,
                     Some(i) if i.paired => PairState::Paired,
@@ -241,6 +243,7 @@ impl Registry {
                 serial: known.and_then(|k| k.serial.clone()).or_else(|| r.serial.clone()),
                 activation_state: None,
                 battery_percent: None,
+                find_my: None,
                 pair_state: PairState::Unknown,
                 cpid: r.cpid,
                 bdid: r.bdid,

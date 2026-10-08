@@ -10,7 +10,7 @@ repository = "https://github.com/Maxjr2/idevice-fleet"
 
 [workspace.dependencies]
 idevice = { version = "=0.1.68", default-features = false, features = ["ring", "usbmuxd", "pair", "restore", "restore_recovery", "tss", "mobilebackup2", "preboard_service", "heartbeat", "diagnostics_relay"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "signal", "process"] }
 tokio-util = "0.7"
 futures = "0.3"
 nusb = { version = "0.2.7", features = ["tokio"] }
@@ -33,9 +33,15 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 eframe = "0.36"
 egui_extras = "0.36"
 
+[profile.dev]
+# Line tables are enough for backtraces and keep the build folder small.
+debug = "line-tables-only"
+incremental = false
+
 [profile.dev.package."*"]
 debug = false
 opt-level = 1
 
 [profile.release]
 lto = "thin"
+strip = true

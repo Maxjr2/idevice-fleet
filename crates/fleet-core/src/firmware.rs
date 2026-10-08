@@ -141,6 +141,16 @@ pub fn fetch_catalog(identifier: &str) -> Result<Catalog> {
     parse_catalog(&body, identifier)
 }
 
+/// Small text download (blocking), for checksum lists.
+pub fn fetch_text(url: &str) -> Result<String> {
+    let mut resp = agent().get(url).call().map_err(net_err)?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return Err(status_err(status, "Download"));
+    }
+    resp.body_mut().with_config().limit(1 << 20).read_to_string().map_err(net_err)
+}
+
 /// Scan the library folder. Blocking.
 pub fn scan_library(dir: &Path) -> Vec<LocalIpsw> {
     let mut out = Vec::new();
@@ -186,13 +196,26 @@ pub struct DownloadParams {
     pub dest_dir: PathBuf,
     pub sha256: Option<String>,
     pub size: Option<u64>,
+    /// Where the file may come from: Apple's servers (firmware) or GitHub (app updates).
+    #[serde(default)]
+    pub source: Source,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Source {
+    #[default]
+    Apple,
+    GitHubRelease,
 }
 
 /// Download with resume and checksum verification. Blocking; the job runner
 /// calls it through `spawn_blocking`. A cancelled download keeps its `.part`
 /// file so the next attempt continues where it stopped.
 pub fn download(ctx: &JobContext, p: &DownloadParams) -> Result<()> {
-    let name = check_download_url(&p.url)?;
+    let name = match p.source {
+        Source::Apple => check_download_url(&p.url)?,
+        Source::GitHubRelease => crate::update::check_update_url(&p.url)?,
+    };
     download_unchecked(ctx, p, &name)
 }
 

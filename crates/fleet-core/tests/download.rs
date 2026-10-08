@@ -61,7 +61,7 @@ fn run_download(dir: &std::path::Path, url: String, sha: Option<String>, size: u
             }) as RunnerFuture
         });
         let policy = RetryPolicy { max_attempts: attempts, base_delay_ms: 10, max_delay_ms: 10, stall_timeout_s: 30, attempt_timeout_s: None };
-        let spec = JobSpec::new(JobKind::Download, "dl", None, policy).with_params(DownloadParams { url, dest_dir: dir.to_path_buf(), sha256: sha, size: Some(size) });
+        let spec = JobSpec::new(JobKind::Download, "dl", None, policy).with_params(DownloadParams { url, dest_dir: dir.to_path_buf(), sha256: sha, size: Some(size), source: Default::default() });
         let id = e.submit(spec).unwrap();
         e.wait_idle().await;
         let v = e.get(&id).unwrap();

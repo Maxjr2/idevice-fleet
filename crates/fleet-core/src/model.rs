@@ -68,6 +68,9 @@ pub struct Device {
     pub serial: Option<String>,
     pub activation_state: Option<String>,
     pub battery_percent: Option<u8>,
+    /// Whether Find My is on (so Activation Lock applies after an erase). Only known for trusted devices.
+    #[serde(default)]
+    pub find_my: Option<bool>,
     pub pair_state: PairState,
     pub cpid: Option<u64>,
     pub bdid: Option<u64>,

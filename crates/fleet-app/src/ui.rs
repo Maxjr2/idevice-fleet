@@ -13,6 +13,7 @@ use fleet_core::model::now_secs;
 use fleet_core::{Device, DeviceKey, DeviceMode, ErrorClass, Fleet, Health, JobId, JobKind, JobState, JobView, Lookup, PairState};
 
 use crate::theme::{self, Palette};
+use crate::wizard::{self, Wizard};
 
 /// Extras used to produce screenshots for the README and for checking the UI.
 #[derive(Default, Clone)]
@@ -22,6 +23,10 @@ pub struct Options {
     pub lookup: Option<String>,
     pub theme: Option<String>,
     pub select_job: bool,
+    /// Open the guided reset at this step (screenshots).
+    pub wizard: Option<String>,
+    /// Seconds to wait before taking a screenshot.
+    pub wait: f32,
 }
 
 struct Notice {
@@ -40,12 +45,29 @@ enum Tab {
 #[derive(Clone, Copy)]
 enum Action {
     Pair,
+    Reset,
     Backup,
     EnterRecovery,
     ExitRecovery,
 }
 
+enum GuideAction {
+    Wizard,
+    Download(String),
+}
+
+struct Guide {
+    title: String,
+    text: String,
+    tone: u8, // 0 info, 1 warning, 2 problem
+    button: Option<(String, GuideAction)>,
+}
+
 pub struct FleetApp {
+    wizard: Option<Wizard>,
+    dismissed_update: Option<String>,
+    cache_confirm: Option<Instant>,
+    storage_polled: Option<Instant>,
     /// Set when drawing the UI panicked; the window shows this instead of crashing.
     crashed: Option<String>,
     tab: Tab,
@@ -77,6 +99,10 @@ impl FleetApp {
             _ => Tab::Devices,
         };
         let mut app = Self {
+            wizard: None,
+            dismissed_update: None,
+            cache_confirm: None,
+            storage_polled: None,
             crashed: None,
             tab,
             identifier: String::new(),
@@ -97,7 +123,83 @@ impl FleetApp {
             app.fleet.start_lookup(&id, app.lookup.clone());
         }
         app.refresh();
+        if let Some(step) = app.opts.wizard.clone() {
+            let step = match step.as_str() {
+                "firmware" => wizard::Step::Firmware,
+                "review" => wizard::Step::Review,
+                "progress" => wizard::Step::Progress,
+                "done" => wizard::Step::Done,
+                _ => wizard::Step::Devices,
+            };
+            app.wizard = Some(Wizard::demo(step, &app.devices, &app.fleet));
+        }
         app
+    }
+
+    fn update_banner(&mut self, ui: &mut egui::Ui, p: Palette) {
+        let fleet_core::update::UpdateState::Available(info) = self.fleet.update_state() else { return };
+        if self.dismissed_update.as_deref() == Some(info.version.as_str()) {
+            return;
+        }
+        let deb_name = info.deb_url.as_deref().and_then(|u| fleet_core::update::check_update_url(u).ok());
+        let downloaded = deb_name.as_deref().is_some_and(|n| self.fleet.paths.updates.join(n).is_file());
+        let job = self.jobs.iter().find(|j| matches!(j.kind, JobKind::Download | JobKind::Install) && j.title.contains("update") && j.state.is_active()).cloned();
+        egui::Frame::new().fill(p.accent.gamma_multiply(0.12)).stroke(Stroke::new(1.0, p.accent.gamma_multiply(0.6))).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 9)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("Version {} is available", info.version)).strong());
+                    let first = info.notes.lines().find(|l| !l.trim().is_empty()).unwrap_or("A new version of iDevice Fleet is ready.");
+                    ui.add(egui::Label::new(RichText::new(first).small().color(p.weak)).truncate());
+                    if let Some(j) = &job {
+                        ui.horizontal(|ui| {
+                            theme::progress_bar(ui, p, j.progress.map(|x| x / 100.0), p.accent, 260.0);
+                            ui.label(RichText::new(j.stage.clone().unwrap_or_default()).small().color(p.weak));
+                        });
+                    } else if downloaded {
+                        ui.label(RichText::new("Downloaded and verified. Installing asks for your password and keeps your settings and data.").small().color(p.weak));
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Later").clicked() {
+                        self.dismissed_update = Some(info.version.clone());
+                    }
+                    if ui.small_button("Release notes").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(&info.page_url));
+                    }
+                    if job.is_some() {
+                        return;
+                    }
+                    if downloaded {
+                        if ui.add(theme::primary_button(p, "Install update")).clicked() {
+                            let r = self.fleet.install_update(deb_name.as_deref().unwrap_or(""));
+                            self.notify(r, "Installing the update");
+                        }
+                    } else if info.deb_url.is_some() && ui.add(theme::primary_button(p, "Download update")).clicked() {
+                        let r = self.fleet.download_update(&info);
+                        self.notify(r, "Downloading the update");
+                    }
+                });
+            });
+        });
+    }
+
+    fn guide(&self) -> Guide {
+        let g = |tone: u8, title: &str, text: &str, button: Option<(&str, GuideAction)>| Guide { title: title.into(), text: text.into(), tone, button: button.map(|(l, a)| (l.to_string(), a)) };
+        if let Health::Down(why) = &self.health.0 {
+            return g(2, "The device service isn't running", &format!("{why}. Without it, connected devices can't be seen."), None);
+        }
+        if self.devices.is_empty() {
+            return g(0, "Connect a device", "Plug in an iPhone or iPad with a USB cable. If it asks, unlock it and tap Trust. A device that's already in recovery mode shows up here too.", None);
+        }
+        if let Some(d) = self.devices.iter().find(|d| d.mode == DeviceMode::Normal && d.pair_state == PairState::NotPaired) {
+            return g(1, &format!("Trust this computer on {}", device_title(d)), "Unlock the device, then use Trust below and tap Trust on its screen. It's only needed to back up or to put it into recovery mode for you. A reset also works if you put the device into recovery mode by hand.", None);
+        }
+        let lib = self.fleet.library();
+        if let Some(m) = self.devices.iter().filter_map(|d| d.product_type.clone()).find(|m| fleet_core::firmware::matching(&lib, m).is_empty()) {
+            return g(1, &format!("Get firmware for {m}"), "A reset installs fresh firmware, so it has to be downloaded first. One click fetches the newest version Apple still signs (about 10 GB, resumes if interrupted).", Some(("Download firmware", GuideAction::Download(m))));
+        }
+        g(0, "Ready to go", "Everything is in place. Reset & reinstall walks you through wiping devices step by step. If the data on a device matters, use Back up on it first.", Some(("Reset & reinstall…", GuideAction::Wizard)))
     }
 
     fn refresh(&mut self) {
@@ -170,6 +272,11 @@ impl FleetApp {
             if attention > 0 {
                 theme::pill(ui, &format!("{attention} need attention"), p.warn);
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add_enabled(!self.devices.is_empty(), theme::primary_button(p, "Reset & reinstall…")).on_hover_text("A guided reset of one or more devices").clicked() {
+                    self.wizard = Some(Wizard::new(None));
+                }
+            });
         });
         if self.devices.is_empty() {
             theme::empty_state(ui, p, "No devices connected", "Connect an iPhone or iPad by USB. Devices in recovery or DFU mode show up here too.");
@@ -177,6 +284,32 @@ impl FleetApp {
         }
         let mut action: Option<(Action, DeviceKey)> = None;
         let devices = self.devices.clone();
+        let guide = self.guide();
+        let mut guide_click = false;
+        let tone = [p.info, p.warn, p.bad][guide.tone as usize];
+        egui::Frame::new().fill(tone.gamma_multiply(0.10)).stroke(Stroke::new(1.0, tone.gamma_multiply(0.5))).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(&guide.title).strong().size(15.0));
+                    ui.add(egui::Label::new(RichText::new(&guide.text).color(p.text)).wrap());
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some((label, _)) = &guide.button {
+                        guide_click = ui.add(theme::primary_button(p, label)).clicked();
+                    }
+                });
+            });
+        });
+        if guide_click && let Some((_, a)) = guide.button {
+            match a {
+                GuideAction::Wizard => self.wizard = Some(Wizard::new(None)),
+                GuideAction::Download(m) => {
+                    self.fleet.download_latest_signed(&m);
+                    self.notice = Some(Notice { text: format!("Looking up the newest signed firmware for {m}, the download starts automatically"), error: false, until: Instant::now() + Duration::from_secs(6) });
+                }
+            }
+        }
         egui::ScrollArea::vertical().id_salt("devices").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
             for d in &devices {
@@ -188,7 +321,12 @@ impl FleetApp {
             ui.add_space(6.0);
         });
         if let Some((a, key)) = action {
+            if matches!(a, Action::Reset) {
+                self.wizard = Some(Wizard::new(Some(key)));
+                return;
+            }
             let (r, what) = match a {
+                Action::Reset => unreachable!("handled above"),
                 Action::Pair => (self.fleet.pair(&key), "Pairing"),
                 Action::Backup => (self.fleet.backup(&key), "Backup"),
                 Action::EnterRecovery => (self.fleet.enter_recovery(&key), "Entering recovery"),
@@ -337,6 +475,83 @@ impl FleetApp {
                     });
                 }
             });
+            self.storage_card(ui, p);
+        });
+    }
+
+    fn storage_card(&mut self, ui: &mut egui::Ui, p: Palette) {
+        if self.storage_polled.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
+            self.storage_polled = Some(Instant::now());
+            self.fleet.refresh_storage();
+        }
+        let st = self.fleet.storage();
+        theme::card(p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("Storage").size(16.0).strong());
+            let rows = [
+                ("Firmware library", st.firmware, "Kept. Downloaded firmware used for resets."),
+                ("Backups", st.backups, "Kept. Your device backups."),
+                ("Logs", st.logs, "Job logs and the app log."),
+            ];
+            for (name, bytes, note) in rows {
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new(name).strong()));
+                    ui.add_sized([90.0, 20.0], egui::Label::new(fmt_size(bytes)));
+                    ui.label(RichText::new(note).small().color(p.weak));
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add_sized([150.0, 20.0], egui::Label::new(RichText::new("Cache").strong()));
+                ui.add_sized([90.0, 20.0], egui::Label::new(fmt_size(st.cache_total())));
+                ui.label(RichText::new(format!("Unfinished downloads {} · restore working files {}", fmt_size(st.partial_downloads), fmt_size(st.restore_cache))).small().color(p.weak));
+            });
+            ui.horizontal(|ui| {
+                let armed = self.cache_confirm.is_some_and(|t| t.elapsed() < Duration::from_secs(4));
+                let label = if armed { "Click again to delete the cache" } else { "Delete cache" };
+                let btn = if armed { egui::Button::new(RichText::new(label).color(egui::Color32::WHITE).strong()).fill(p.bad) } else { egui::Button::new(label) };
+                if ui.add_enabled(st.cache_total() > 0, btn).on_hover_text("Deletes unfinished downloads and leftover restore files. Downloaded firmware and backups are kept.").clicked() {
+                    if armed {
+                        self.cache_confirm = None;
+                        match self.fleet.clear_cache() {
+                            Ok(freed) => self.notice = Some(Notice { text: format!("Deleted the cache and freed {}", fmt_size(freed)), error: false, until: Instant::now() + Duration::from_secs(6) }),
+                            Err(e) => self.notice = Some(Notice { text: e.message, error: true, until: Instant::now() + Duration::from_secs(8) }),
+                        }
+                        self.fleet.refresh_storage();
+                        self.storage_polled = Some(Instant::now());
+                    } else {
+                        self.cache_confirm = Some(Instant::now());
+                    }
+                }
+                ui.label(RichText::new("A restore removes its own working files when it ends, so this is usually small.").small().color(p.weak));
+            });
+        });
+        theme::card(p).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new("About").size(16.0).strong());
+            ui.horizontal(|ui| {
+                ui.label(format!("iDevice Fleet {}", env!("CARGO_PKG_VERSION")));
+                match self.fleet.update_state() {
+                    fleet_core::update::UpdateState::Checking => {
+                        ui.spinner();
+                        ui.label("Checking for updates…");
+                    }
+                    fleet_core::update::UpdateState::UpToDate => {
+                        theme::pill(ui, "up to date", p.ok);
+                    }
+                    fleet_core::update::UpdateState::Available(i) => {
+                        theme::pill(ui, &format!("{} available", i.version), p.accent);
+                    }
+                    fleet_core::update::UpdateState::Failed(e) => {
+                        ui.label(RichText::new(format!("Couldn't check: {e}")).small().color(p.warn));
+                    }
+                    fleet_core::update::UpdateState::Unknown => {}
+                }
+                if ui.button("Check for updates").clicked() {
+                    self.dismissed_update = None;
+                    self.fleet.check_for_updates();
+                }
+            });
         });
     }
 
@@ -463,6 +678,7 @@ impl FleetApp {
             .stroke(Stroke::new(if selected { 1.5 } else { 1.0 }, if selected { p.accent } else { p.line }))
             .corner_radius(CornerRadius::same(9))
             .inner_margin(egui::Margin::symmetric(11, 9));
+        let mut clicked_inside = false;
         let resp = frame
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -471,10 +687,14 @@ impl FleetApp {
                     ui.add(egui::Label::new(RichText::new(&j.title).strong()).truncate());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if j.state.is_active() {
-                            if ui.small_button("Cancel").clicked() {
+                            let label = if j.cancelling { "Cancelling…" } else { "Cancel" };
+                            if ui.add_enabled(!j.cancelling, egui::Button::new(label).small()).clicked() {
+                                clicked_inside = true;
                                 self.fleet.engine.cancel(&j.id);
+                                self.revision = 0;
                             }
                         } else if j.state != JobState::Succeeded && ui.small_button("Run again").clicked() {
+                            clicked_inside = true;
                             let r = self.fleet.engine.run_again(&j.id);
                             self.notify(r, "Job");
                         }
@@ -513,7 +733,9 @@ impl FleetApp {
                 }
             })
             .response;
-        if resp.interact(Sense::click()).clicked() {
+        // Select the card on click. Checked from the pointer state rather than by
+        // laying a click area over the card, which would swallow the buttons' clicks.
+        if !clicked_inside && ui.rect_contains_pointer(resp.rect) && ui.input(|i| i.pointer.primary_clicked()) {
             self.selected_job = Some(j.id.clone());
         }
     }
@@ -547,7 +769,8 @@ impl FleetApp {
         self.frames += 1;
         ctx.request_repaint();
         let waiting = matches!(*self.lookup.lock().unwrap_or_else(|e| e.into_inner()), Lookup::Loading);
-        if !self.shot_requested && self.frames > 90 && !waiting {
+        let wait_frames = 90 + (self.opts.wait * 60.0) as u32;
+        if !self.shot_requested && self.frames > wait_frames && !waiting {
             self.shot_requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
@@ -624,6 +847,9 @@ fn device_card(ui: &mut egui::Ui, p: Palette, d: &Device, job: Option<&JobView>)
                     let free = !busy;
                     match d.mode {
                         DeviceMode::Normal => {
+                            if ui.add_enabled(free, egui::Button::new("Reset…")).on_hover_text("Erase and reinstall, guided").clicked() {
+                                action = Some(Action::Reset);
+                            }
                             if ui.add_enabled(free && paired, egui::Button::new("Recovery mode")).clicked() {
                                 action = Some(Action::EnterRecovery);
                             }
@@ -635,6 +861,9 @@ fn device_card(ui: &mut egui::Ui, p: Palette, d: &Device, job: Option<&JobView>)
                             }
                         }
                         DeviceMode::Recovery | DeviceMode::Dfu => {
+                            if ui.add_enabled(free, theme::primary_button(p, "Reset…")).on_hover_text("Erase and reinstall, guided").clicked() {
+                                action = Some(Action::Reset);
+                            }
                             if ui.add_enabled(free, egui::Button::new("Exit recovery")).on_hover_text("Restart into normal mode").clicked() {
                                 action = Some(Action::ExitRecovery);
                             }
@@ -661,7 +890,7 @@ fn device_card(ui: &mut egui::Ui, p: Palette, d: &Device, job: Option<&JobView>)
     action
 }
 
-fn device_title(d: &Device) -> String {
+pub(crate) fn device_title(d: &Device) -> String {
     if d.name.is_some() || d.product_type.is_some() || d.serial.is_some() {
         d.label()
     } else {
@@ -669,7 +898,10 @@ fn device_title(d: &Device) -> String {
     }
 }
 
-fn job_state(p: Palette, j: &JobView) -> (Color32, &'static str) {
+pub(crate) fn job_state(p: Palette, j: &JobView) -> (Color32, &'static str) {
+    if j.cancelling && j.state.is_active() {
+        return (p.warn, "Cancelling");
+    }
     match j.state {
         JobState::Succeeded => (p.ok, "Done"),
         JobState::Running => (p.info, "Running"),
@@ -690,7 +922,7 @@ fn health_chip(ui: &mut egui::Ui, p: Palette, name: &str, h: &Health) {
     theme::status_chip(ui, name, color).on_hover_text(tip);
 }
 
-fn fmt_size(b: u64) -> String {
+pub(crate) fn fmt_size(b: u64) -> String {
     match b {
         0..=999_999 => format!("{:.0} KB", b as f64 / 1e3),
         1_000_000..=999_999_999 => format!("{:.0} MB", b as f64 / 1e6),
@@ -768,6 +1000,7 @@ impl FleetApp {
                 self.jobs_panel(ui, p);
             });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(16, 14))).show(ui, |ui| {
+            self.update_banner(ui, p);
             if let Some(n) = &self.notice {
                 if Instant::now() < n.until {
                     let c = if n.error { p.bad } else { p.ok };
@@ -785,6 +1018,18 @@ impl FleetApp {
                 Tab::Backups => self.backups_tab(ui, p),
             }
         });
+        if let Some(mut w) = self.wizard.take() {
+            let devices = self.devices.clone();
+            let jobs = self.jobs.clone();
+            match w.show(ui.ctx(), &self.fleet, &devices, &jobs, p) {
+                wizard::Outcome::Open => self.wizard = Some(w),
+                wizard::Outcome::Close => self.revision = 0,
+                wizard::Outcome::GoFirmware => {
+                    self.tab = Tab::Firmware;
+                    self.revision = 0;
+                }
+            }
+        }
         self.screenshot_tick(ui.ctx());
         // Device and job changes arrive from other threads; poll cheaply.
         ui.ctx().request_repaint_after(Duration::from_millis(400));
