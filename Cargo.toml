@@ -27,7 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 sha2 = "0.11"
 hex = "0.4"
-zip = { version = "4", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 eframe = "0.36"
